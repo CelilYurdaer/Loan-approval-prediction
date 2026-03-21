@@ -5,14 +5,18 @@ Predicts whether a loan application will be approved or rejected
 based on applicant financial and demographic features.
 
 Pipeline:
-    1. Data Loading & Inspection
+    1. Data Loading & Validation
     2. Data Cleaning & Preprocessing
     3. Exploratory Data Analysis (EDA)
     4. Feature Engineering
-    5. Model Training (Logistic Regression, Decision Tree, Random Forest)
-    6. Model Evaluation (Confusion Matrix, ROC-AUC, Classification Report)
-    7. Feature Importance Analysis
-    8. Insights Summary
+    5. Outlier Analysis & Impact Comparison
+    6. Model Training (Pipeline: StandardScaler → Classifier)
+    7. Threshold Optimization
+    8. Probability Calibration (Platt Scaling)
+    9. Hyperparameter Tuning (RandomizedSearchCV)
+    10. Feature Importance (MDI + Permutation)
+    11. SHAP Model Explainability
+    12. Insights Summary
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -30,7 +34,7 @@ import seaborn as sns
 # Set global random seed for full reproducibility across numpy and sklearn.
 np.random.seed(42)
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
@@ -43,6 +47,13 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score
 )
 from sklearn.inspection import permutation_importance
+
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    print("  ⚠ SHAP not installed. Run: pip install shap")
 
 sns.set_style("whitegrid")
 sns.set_context("notebook", font_scale=1.1)
@@ -121,11 +132,19 @@ def validate_dataset(df: pd.DataFrame) -> bool:
     all_valid = True
     for col, (rule, check_fn) in checks.items():
         if col in df.columns:
-            valid = check_fn(df[col].dropna())
+            series = df[col].dropna()
+            valid = check_fn(series)
             status = "✓" if valid else "⚠ FAILED"
             print(f"  {status} {col} {rule}")
             if not valid:
-                n_invalid = (~check_fn(df[col].dropna())).sum() if not valid else 0
+                # Re-check per element to count invalid rows.
+                # check_fn uses .all() so we rebuild the boolean series.
+                if rule == "300-900 range":
+                    n_invalid = (~series.between(300, 900)).sum()
+                elif "≥" in rule:
+                    n_invalid = (series < 0).sum()
+                else:
+                    n_invalid = (series <= 0).sum()
                 print(f"      → {n_invalid} invalid values found")
                 all_valid = False
 
@@ -775,7 +794,7 @@ def calibrate_best_model(results, X_train, X_test, y_train, y_test):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 9. MODEL EVALUATION VISUALIZATIONS
+# 9b. MODEL EVALUATION VISUALIZATIONS
 # ─────────────────────────────────────────────────────────────────────
 
 def plot_model_evaluation(results: dict, y_test):
@@ -871,6 +890,7 @@ def plot_feature_importance(results: dict, X_test, y_test, feature_names):
 
     best_name = max(results, key=lambda k: results[k]["f1"])
     best_model = results[best_name]["model"]
+    best_pipeline = results[best_name]["pipeline"]
 
     print(f"\n  Best model: {best_name} (F1 = {results[best_name]['f1']:.4f})")
 
@@ -896,9 +916,11 @@ def plot_feature_importance(results: dict, X_test, y_test, feature_names):
                      f"{val:.3f}", va="center", fontweight="bold")
 
     # ---- Right: Permutation importance --------------------------------------
-    # n_repeats=10 shuffles each feature 10 times for stable estimates.
+    # Uses the full pipeline (scaler + model) with unscaled X_test.
+    # The pipeline handles scaling internally, so permutation shuffles
+    # happen on the original feature values — which is the correct behavior.
     perm_result = permutation_importance(
-        best_model, X_test, y_test,
+        best_pipeline, X_test, y_test,
         n_repeats=10, random_state=42, scoring="f1"
     )
     perm = pd.Series(
@@ -922,7 +944,245 @@ def plot_feature_importance(results: dict, X_test, y_test, feature_names):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 11. INSIGHTS SUMMARY
+# 11. HYPERPARAMETER TUNING
+# ─────────────────────────────────────────────────────────────────────
+
+def tune_best_model(results, X_train, y_train):
+    """Tune the best model's hyperparameters using RandomizedSearchCV.
+
+    GridSearchCV tries every combination of parameters — exhaustive but
+    slow. RandomizedSearchCV samples random combinations — faster and
+    often finds equally good results. With n_iter=50, it tests 50 random
+    parameter sets instead of the full grid which could be thousands.
+
+    The search is wrapped in a Pipeline to prevent data leakage:
+    scaler is re-fit on each CV fold's training data, not the full set.
+    """
+
+    print("=" * 60)
+    print("HYPERPARAMETER TUNING (RandomizedSearchCV)")
+    print("=" * 60)
+
+    best_name = max(results, key=lambda k: results[k]["f1"])
+    print(f"  Tuning: {best_name}")
+    print(f"  Pre-tuning F1: {results[best_name]['f1']:.4f}\n")
+
+    # Parameter distributions to sample from.
+    # Each key is prefixed with "model__" because the estimator is inside
+    # a Pipeline (Pipeline step named "model").
+    if best_name == "Random Forest":
+        param_distributions = {
+            "model__n_estimators": [50, 100, 200, 300, 500],
+            "model__max_depth": [3, 5, 7, 10, 15, 20, None],
+            "model__min_samples_split": [2, 5, 10, 20],
+            "model__min_samples_leaf": [1, 2, 4, 8],
+            "model__max_features": ["sqrt", "log2", None],
+        }
+    elif best_name == "Decision Tree":
+        param_distributions = {
+            "model__max_depth": [3, 5, 7, 10, 15, 20, None],
+            "model__min_samples_split": [2, 5, 10, 20, 50],
+            "model__min_samples_leaf": [1, 2, 4, 8, 16],
+            "model__criterion": ["gini", "entropy"],
+        }
+    else:  # Logistic Regression
+        param_distributions = {
+            "model__C": [0.001, 0.01, 0.1, 1, 10, 100],
+            "model__penalty": ["l1", "l2"],
+            "model__solver": ["liblinear", "saga"],
+        }
+
+    search = RandomizedSearchCV(
+        results[best_name]["pipeline"],
+        param_distributions,
+        n_iter=50,           # test 50 random combinations
+        cv=5,                # 5-fold cross-validation
+        scoring="f1",        # optimize for F1, not accuracy
+        random_state=42,
+        n_jobs=-1,           # use all CPU cores for parallel search
+        verbose=0,
+    )
+
+    search.fit(X_train, y_train)
+
+    print(f"  Best parameters found:")
+    for param, val in search.best_params_.items():
+        clean_param = param.replace("model__", "")
+        print(f"    {clean_param}: {val}")
+    print(f"\n  Best CV F1: {search.best_score_:.4f}")
+
+    # Compare top 5 parameter sets
+    cv_results = pd.DataFrame(search.cv_results_)
+    top5 = cv_results.nsmallest(5, "rank_test_score")[
+        ["rank_test_score", "mean_test_score", "std_test_score", "params"]
+    ]
+    print("\n  Top 5 parameter combinations:")
+    for _, row in top5.iterrows():
+        params_short = {k.replace("model__", ""): v
+                        for k, v in row["params"].items()}
+        print(f"    Rank {int(row['rank_test_score'])}: "
+              f"F1 = {row['mean_test_score']:.4f} ± {row['std_test_score']:.4f} "
+              f"| {params_short}")
+
+    print()
+    return search.best_estimator_, search.best_params_
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 12. SHAP MODEL EXPLAINABILITY
+# ─────────────────────────────────────────────────────────────────────
+
+def run_shap_analysis(tuned_pipeline, X_train, X_test, feature_names):
+    """Generate SHAP explanations for the tuned model.
+
+    SHAP (SHapley Additive exPlanations) comes from game theory.
+    It answers: "how much did each feature contribute to THIS specific
+    prediction?" Unlike feature importance which gives global rankings,
+    SHAP explains individual predictions.
+
+    Example: for applicant #42, SHAP might say "CIBIL score pushed the
+    prediction toward approval by +0.3, but high loan_to_income pulled
+    it toward rejection by -0.15."
+
+    This is critical for financial applications where regulations often
+    require explainable decisions (why was this loan rejected?).
+    """
+
+    if not SHAP_AVAILABLE:
+        print("  ⚠ SHAP not available. Skipping explainability analysis.")
+        print("  Install with: pip install shap")
+        return None
+
+    print("=" * 60)
+    print("SHAP MODEL EXPLAINABILITY")
+    print("=" * 60)
+
+    # Extract the trained model from the Pipeline.
+    # SHAP needs the model and the already-scaled data separately.
+    scaler = tuned_pipeline.named_steps["scaler"]
+    model = tuned_pipeline.named_steps["model"]
+
+    X_train_scaled = pd.DataFrame(
+        scaler.transform(X_train),
+        columns=feature_names, index=X_train.index
+    )
+    X_test_scaled = pd.DataFrame(
+        scaler.transform(X_test),
+        columns=feature_names, index=X_test.index
+    )
+
+    # TreeExplainer is exact and fast for tree-based models.
+    # For linear models, use shap.LinearExplainer instead.
+    if hasattr(model, "feature_importances_"):
+        explainer = shap.TreeExplainer(model)
+    else:
+        explainer = shap.LinearExplainer(model, X_train_scaled)
+
+    # Calculate SHAP values for the test set.
+    # Each value represents how much that feature pushed the prediction
+    # away from the base rate (average prediction across all samples).
+    shap_values = explainer.shap_values(X_test_scaled)
+
+    # For binary classification, TreeExplainer returns a list of two arrays
+    # [shap_values_class_0, shap_values_class_1]. Use class 1 (Approved).
+    # Newer SHAP versions may return a 3D array (samples × features × classes).
+    if isinstance(shap_values, list):
+        shap_vals = shap_values[1]
+    elif shap_values.ndim == 3:
+        shap_vals = shap_values[:, :, 1]
+    else:
+        shap_vals = shap_values
+
+    # ---- Plot 1: SHAP Summary (Beeswarm) ------------------------------------
+    # Each dot is one prediction. X-axis = SHAP value (impact on prediction).
+    # Color = feature value (red = high, blue = low).
+    # A cluster of red dots on the right means "high values of this feature
+    # push the prediction toward approval."
+    plt.figure(figsize=(12, 8))
+    shap.summary_plot(shap_vals, X_test_scaled, show=False, plot_size=None)
+    plt.title("SHAP Summary — Feature Impact on Predictions",
+              fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("shap_summary.png", dpi=150, bbox_inches="tight")
+    print("✓ SHAP summary saved → shap_summary.png")
+    plt.show()
+
+    # ---- Plot 2: SHAP Bar (Mean absolute impact) ----------------------------
+    # Global ranking of features by average absolute SHAP value.
+    # Unlike MDI or permutation importance, this accounts for feature
+    # interactions and is consistent with the individual explanations.
+    plt.figure(figsize=(10, 7))
+    shap.summary_plot(shap_vals, X_test_scaled, plot_type="bar",
+                      show=False, plot_size=None)
+    plt.title("SHAP — Mean Absolute Impact per Feature",
+              fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("shap_bar.png", dpi=150, bbox_inches="tight")
+    print("✓ SHAP bar plot saved → shap_bar.png")
+    plt.show()
+
+    # ---- Plot 3: SHAP Waterfall for a single prediction ----------------------
+    # Explains one specific applicant's prediction step by step.
+    # Starts from the base value (average prediction) and shows how each
+    # feature pushed the final prediction up or down.
+    sample_idx = 0
+    # expected_value can be a list, array, or scalar depending on SHAP version.
+    # Force it to a Python float for waterfall_plot compatibility.
+    if isinstance(explainer.expected_value, (list, np.ndarray)):
+        base_val = float(explainer.expected_value[1])
+    else:
+        base_val = float(explainer.expected_value)
+
+    shap.waterfall_plot(
+        shap.Explanation(
+            values=shap_vals[sample_idx],
+            base_values=base_val,
+            data=X_test_scaled.iloc[sample_idx],
+            feature_names=list(feature_names)
+        ),
+        show=False
+    )
+    plt.title("SHAP Waterfall — Single Applicant Explanation",
+              fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("shap_waterfall.png", dpi=150, bbox_inches="tight")
+    print("✓ SHAP waterfall saved → shap_waterfall.png")
+    plt.show()
+
+    # ---- Plot 4: SHAP Dependence for top feature ----------------------------
+    # Shows how one feature's SHAP value changes across its range,
+    # colored by the feature it interacts with most.
+    top_feature_idx = np.argmax(np.abs(shap_vals).mean(axis=0))
+    top_feature_name = feature_names[top_feature_idx]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    shap.dependence_plot(
+        top_feature_idx, shap_vals, X_test_scaled,
+        feature_names=list(feature_names), show=False, ax=ax
+    )
+    ax.set_title(f"SHAP Dependence — {top_feature_name}",
+                 fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("shap_dependence.png", dpi=150, bbox_inches="tight")
+    print("✓ SHAP dependence saved → shap_dependence.png")
+    plt.show()
+
+    # Print top feature impacts
+    mean_abs_shap = np.abs(shap_vals).mean(axis=0)
+    feature_impact = pd.Series(
+        mean_abs_shap, index=feature_names
+    ).sort_values(ascending=False)
+
+    print("\n  Top features by mean |SHAP value|:")
+    for feat, val in feature_impact.head(10).items():
+        bar = "█" * int(val * 100)
+        print(f"    {feat:30s} {val:.4f}  {bar}")
+
+    print()
+    return shap_vals
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 13. INSIGHTS SUMMARY
 # ─────────────────────────────────────────────────────────────────────
 
 def print_insights(df, insights, results):
@@ -958,6 +1218,9 @@ def print_insights(df, insights, results):
         f"6. Optimal decision threshold is {best['optimal_threshold']:.2f} "
         f"(vs default 0.5), yielding F1 = {best['f1_at_optimal']:.4f}. "
         f"{'Threshold optimization improved F1.' if best['f1_at_optimal'] > best['f1'] else 'Default threshold was already near-optimal.'}",
+
+        f"7. Hyperparameter tuning via RandomizedSearchCV tested 50 parameter "
+        f"combinations with 5-fold CV to find the optimal model configuration.",
     ]
 
     for line in insights_text:
@@ -966,7 +1229,7 @@ def print_insights(df, insights, results):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 12. MAIN PIPELINE
+# 14. MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -988,6 +1251,11 @@ if __name__ == "__main__":
     X_train, X_test, y_train, y_test = prepare_data(final_df)
     model_results = train_models(X_train, X_test, y_train, y_test)
 
+    # --- Hyperparameter tuning ---
+    tuned_pipeline, best_params = tune_best_model(
+        model_results, X_train, y_train
+    )
+
     # --- Outlier impact comparison ---
     outlier_comparison = compare_outlier_impact(final_df, outlier_mask)
 
@@ -1003,10 +1271,16 @@ if __name__ == "__main__":
         model_results, X_test, y_test, X_train.columns
     )
 
+    # --- SHAP Explainability ---
+    shap_values = run_shap_analysis(
+        tuned_pipeline, X_train, X_test, X_train.columns
+    )
+
     # --- Summary ---
     print_insights(final_df, eda_insights, model_results)
 
     print("✅ Analysis complete. Outputs: eda_dashboard.png, "
           "correlation_heatmap.png, model_evaluation.png, "
           "model_comparison.png, feature_importance.png, "
-          "calibration_plot.png")
+          "calibration_plot.png, shap_summary.png, shap_bar.png, "
+          "shap_waterfall.png, shap_dependence.png")

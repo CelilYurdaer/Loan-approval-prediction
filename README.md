@@ -1,6 +1,6 @@
 # Loan Approval Prediction
 
-A machine learning classification project that predicts loan approval outcomes based on applicant financial and demographic data. Compares Logistic Regression, Decision Tree, and Random Forest models with probability calibration and threshold optimization.
+A machine learning classification project that predicts loan approval outcomes based on applicant financial and demographic data. Features hyperparameter tuning, probability calibration, threshold optimization, and SHAP model explainability.
 
 ---
 
@@ -16,6 +16,8 @@ Lending institutions need to assess credit risk quickly and accurately. This pro
 - Does the model generalize well, or is it overfitting to the training data?
 - Is the default 0.5 decision threshold optimal for financial risk?
 - Are the model's predicted probabilities reliable enough to use as default risk estimates?
+- What are the optimal hyperparameters, and how sensitive is performance to them?
+- Can we explain *why* the model approved or rejected a specific applicant?
 
 ## Key Findings
 
@@ -29,10 +31,12 @@ Lending institutions need to assess credit risk quickly and accurately. This pro
 | **Outliers** | IQR analysis + with/without outlier model comparison to measure impact |
 | **Threshold** | Optimal decision threshold found via F1 sweep across 0.1–0.9 range |
 | **Calibration** | Platt scaling applied for reliable probability estimates (Brier score reported) |
+| **Tuning** | RandomizedSearchCV (50 iterations, 5-fold CV) finds optimal hyperparameters |
+| **Explainability** | SHAP analysis reveals per-feature and per-prediction contributions |
 
 ## Visualizations
 
-The script generates six chart images:
+The script generates ten chart images:
 
 - **`eda_dashboard.png`** — Approval distribution, CIBIL score by status, loan-to-income boxplots, feature correlations
 - **`correlation_heatmap.png`** — Full feature correlation matrix
@@ -40,12 +44,17 @@ The script generates six chart images:
 - **`model_comparison.png`** — Side-by-side metric comparison (accuracy, precision, recall, F1, ROC-AUC)
 - **`feature_importance.png`** — MDI (tree-based) and permutation importance side by side
 - **`calibration_plot.png`** — Before/after calibration curve with Brier scores and probability distributions
+- **`shap_summary.png`** — Beeswarm plot showing each feature's impact direction and magnitude per prediction
+- **`shap_bar.png`** — Global feature ranking by mean absolute SHAP value
+- **`shap_waterfall.png`** — Step-by-step explanation of a single applicant's prediction
+- **`shap_dependence.png`** — How the top feature's SHAP value varies across its range, colored by interaction feature
 
 ## Tools & Technologies
 
 - **Python 3** — core language
 - **pandas & NumPy** — data manipulation
-- **scikit-learn** — Pipeline, model training, evaluation, calibration, permutation importance
+- **scikit-learn** — Pipeline, model training, evaluation, calibration, hyperparameter tuning, permutation importance
+- **SHAP** — model explainability (Shapley values from game theory)
 - **Matplotlib & Seaborn** — visualization
 
 ## Project Structure
@@ -61,6 +70,10 @@ loan-approval-prediction/
 ├── model_comparison.png        # Metric comparison chart
 ├── feature_importance.png      # MDI + permutation importance
 ├── calibration_plot.png        # Probability calibration curves
+├── shap_summary.png            # SHAP beeswarm plot
+├── shap_bar.png                # SHAP global feature ranking
+├── shap_waterfall.png          # SHAP single prediction explanation
+├── shap_dependence.png         # SHAP dependence plot for top feature
 └── README.md                   # This file
 ```
 
@@ -74,7 +87,7 @@ loan-approval-prediction/
 
 2. **Install dependencies**
    ```bash
-   pip install pandas numpy matplotlib seaborn scikit-learn
+   pip install pandas numpy matplotlib seaborn scikit-learn shap
    ```
 
 3. **Run the analysis**
@@ -85,7 +98,7 @@ loan-approval-prediction/
 ## Analysis Pipeline
 
 ```
-Load → Validate → Clean & Encode → Engineer Features → EDA → Outlier Analysis → Train (Pipeline) → Calibrate → Evaluate → Insights
+Load → Validate → Clean & Encode → Engineer Features → EDA → Outlier Analysis → Train (Pipeline) → Tune → Calibrate → SHAP → Evaluate → Insights
 ```
 
 1. **Data Loading** — Read CSV, strip whitespace from columns and values
@@ -95,10 +108,12 @@ Load → Validate → Clean & Encode → Engineer Features → EDA → Outlier A
 5. **EDA** — Target distribution, correlation analysis, descriptive statistics
 6. **Outlier Detection** — IQR-based analysis + model comparison with/without outliers to measure their impact
 7. **Model Training** — sklearn Pipeline (StandardScaler → Model) with class_weight="balanced" and leak-free 5-fold cross-validation
-8. **Threshold Optimization** — F1 sweep across 0.1–0.9 to find optimal decision boundary for financial risk
-9. **Probability Calibration** — CalibratedClassifierCV (Platt scaling) for reliable default probability estimates
-10. **Evaluation** — Confusion matrix, ROC-AUC, precision/recall/F1, permutation importance
-11. **Insights Summary** — Plain-language takeaways
+8. **Hyperparameter Tuning** — RandomizedSearchCV (50 iterations, 5-fold CV) optimizing F1 score with parallel execution
+9. **Threshold Optimization** — F1 sweep across 0.1–0.9 to find optimal decision boundary for financial risk
+10. **Probability Calibration** — CalibratedClassifierCV (Platt scaling) for reliable default probability estimates
+11. **SHAP Explainability** — Beeswarm, bar, waterfall, and dependence plots for global and local model interpretation
+12. **Evaluation** — Confusion matrix, ROC-AUC, precision/recall/F1, permutation importance
+13. **Insights Summary** — Plain-language takeaways
 
 ## Models Compared
 
@@ -116,19 +131,17 @@ All models use `class_weight="balanced"` to handle the 62/38 class imbalance.
 - **Train/test split with stratification** — preserves class balance across sets
 - **Cross-validation (leak-free)** — Pipeline ensures scaler is fit only on each CV training fold
 - **class_weight="balanced"** — penalizes minority class misclassification more heavily
+- **RandomizedSearchCV** — efficient hyperparameter optimization sampling 50 random combinations
 - **Decision threshold optimization** — F1-maximizing threshold search for financial applications
 - **Probability calibration** — Platt scaling via CalibratedClassifierCV with Brier score evaluation
+- **SHAP explainability** — game-theory-based feature attribution for global and per-prediction explanations
 - **Permutation importance** — unbiased feature ranking that avoids MDI's high-cardinality bias
 - **Outlier impact analysis** — trains models with and without outliers to justify keep/remove decisions
 - **Dataset validation** — automated sanity checks before processing
-- **ROC-AUC** — evaluates classifier quality beyond simple accuracy
-- **Precision vs. recall trade-off** — balancing false approvals against missed opportunities
 
 ## Dataset
 
 The dataset contains 4,269 loan applications with 12 features including income, loan amount, CIBIL credit score, asset values, education level, and employment status. Source: [Kaggle Loan Approval Prediction Dataset](https://www.kaggle.com/datasets/architsharma01/loan-approval-prediction-dataset).
-
-## Contact
 
 Emir Celil Yurdaer — [celilyurdaer@protonmail.com](mailto:celilyurdaer@protonmail.com) — Feel free to open an issue or reach out with questions!
 
